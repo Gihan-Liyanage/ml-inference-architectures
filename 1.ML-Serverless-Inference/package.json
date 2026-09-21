@@ -1,0 +1,14 @@
+{
+  "name": "service-1.ml-serverless-inference",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "gihan liyanage",
+  "license": "MIT",
+  "description": "",
+  "dependencies": {
+    "serverless": "^3.40.0"
+  }
+}
