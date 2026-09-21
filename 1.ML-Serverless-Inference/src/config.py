@@ -1,0 +1,4 @@
+import os
+
+MODEL_BUCKET_NAME = os.environ["MODEL_BUCKET_NAME"]
+MODEL_OBJECT_KEY = os.environ["MODEL_OBJECT_KEY"]

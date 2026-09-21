@@ -2,6 +2,10 @@ service: ml-serverless-inference
 
 frameworkVersion: '3'
 
+custom:
+  modelBucketName: codewave-${sls:stage}-ml-models
+  modelObjectKey: models/mlr_mpg_v1.joblib
+
 provider:
   name: aws
   ecr:
@@ -12,27 +16,18 @@ provider:
   stage: dev
   region: eu-west-1
 
-# you can add statements to the Lambda function's IAM Role here
-#  iam:
-#    role:
-#      statements:
-#        - Effect: "Allow"
-#          Action:
-#            - "s3:ListBucket"
-#          Resource: { "Fn::Join" : ["", ["arn:aws:s3:::", { "Ref" : "ServerlessDeploymentBucket" } ] ]  }
-#        - Effect: "Allow"
-#          Action:
-#            - "s3:PutObject"
-#          Resource:
-#            Fn::Join:
-#              - ""
-#              - - "arn:aws:s3:::"
-#                - "Ref" : "ServerlessDeploymentBucket"
-#                - "/*"
+  environment:
+    LOG_LEVEL: ${env:LOG_LEVEL, 'INFO'}
+    MODEL_BUCKET_NAME: ${self:custom.modelBucketName}
+    MODEL_OBJECT_KEY: ${self:custom.modelObjectKey}
 
-# you can define service wide environment variables here
-#  environment:
-#    variable1: value1
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource: "arn:aws:s3:::${self:custom.modelBucketName}/${self:custom.modelObjectKey}"
 
 functions:
   predict:
@@ -45,13 +40,15 @@ functions:
           method: post
 
 
-# you can add CloudFormation resource templates here
-#resources:
-#  Resources:
-#    NewResource:
-#      Type: AWS::S3::Bucket
-#      Properties:
-#        BucketName: my-new-bucket
+resources:
+  Resources:
+    MlModelsBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain
+      Properties:
+        BucketName: ${self:custom.modelBucketName}
+        VersioningConfiguration:
+          Status: Enabled
 #  Outputs:
 #     NewOutput:
 #       Description: "Description for the output"
