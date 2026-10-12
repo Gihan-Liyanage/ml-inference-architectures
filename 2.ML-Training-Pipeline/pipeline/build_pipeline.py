@@ -5,6 +5,8 @@
 The bucket and execution role are read from the `ml-training-pipeline-<stage>`
 CloudFormation stack (created by `sls deploy`) unless passed explicitly.
 `--print-definition` prints the pipeline JSON instead of upserting it.
+`--training-job` uses the separate SageMaker Training job step, overriding
+TRAIN_IN_PROCESSING_JOB (needs a training-job quota).
 """
 from __future__ import annotations
 
@@ -42,6 +44,11 @@ CODE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "code")
 # sagemaker/image_uri_config/sklearn.json before bumping it.
 SKLEARN_VERSION = "1.2-1"
 
+# TEMPORARY: train inside the Preprocess processing job (ml.t3.medium) because this
+# account has no SageMaker training-job quota yet. Set to False to restore the
+# separate Train step (SageMaker Training job) once the quota is approved.
+TRAIN_IN_PROCESSING_JOB = True
+
 DEFAULT_R2_THRESHOLD = 0.80
 DEFAULT_RMSE_THRESHOLD = 3.5
 
@@ -54,7 +61,13 @@ def model_package_group_name(stage: str) -> str:
     return f"mpg-linear-regression-{stage}"
 
 
-def build_pipeline(stage: str, bucket: str, role_arn: str, session: PipelineSession) -> Pipeline:
+def build_pipeline(
+    stage: str,
+    bucket: str,
+    role_arn: str,
+    session: PipelineSession,
+    train_in_processing_job: bool = TRAIN_IN_PROCESSING_JOB,
+) -> Pipeline:
     name = pipeline_name(stage)
 
     # --- Parameters (overridable per execution; start_pipeline passes the first four)
@@ -78,40 +91,62 @@ def build_pipeline(stage: str, bucket: str, role_arn: str, session: PipelineSess
         sagemaker_session=session,
     )
 
-    # --- 1. Preprocess: validate + clean the uploaded CSV
-    step_preprocess = ProcessingStep(
-        name="Preprocess",
-        step_args=processor.run(
-            code="preprocess.py",
-            source_dir=CODE_DIR,
-            inputs=[ProcessingInput(source=input_data_uri, destination="/opt/ml/processing/input")],
-            outputs=[ProcessingOutput(output_name="train", source="/opt/ml/processing/train")],
-        ),
-    )
+    if train_in_processing_job:
+        # --- 1+2. Preprocess and train in one processing job (temporary, see TRAIN_IN_PROCESSING_JOB)
+        step_train = ProcessingStep(
+            name="PreprocessAndTrain",
+            step_args=processor.run(
+                code="preprocess_and_train.py",
+                source_dir=CODE_DIR,
+                inputs=[ProcessingInput(source=input_data_uri, destination="/opt/ml/processing/input")],
+                outputs=[
+                    ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
+                    ProcessingOutput(output_name="model", source="/opt/ml/processing/model"),
+                ],
+            ),
+        )
+        model_data = Join(
+            on="/",
+            values=[step_train.properties.ProcessingOutputConfig.Outputs["model"].S3Output.S3Uri, "model.tar.gz"],
+        )
+        training_steps = [step_train]
+    else:
+        # --- 1. Preprocess: validate + clean the uploaded CSV
+        step_preprocess = ProcessingStep(
+            name="Preprocess",
+            step_args=processor.run(
+                code="preprocess.py",
+                source_dir=CODE_DIR,
+                inputs=[ProcessingInput(source=input_data_uri, destination="/opt/ml/processing/input")],
+                outputs=[ProcessingOutput(output_name="train", source="/opt/ml/processing/train")],
+            ),
+        )
 
-    # --- 2. Train
-    estimator = SKLearn(
-        entry_point="train.py",
-        source_dir=CODE_DIR,
-        framework_version=SKLEARN_VERSION,
-        role=role_arn,
-        instance_type=training_instance_type,
-        instance_count=1,
-        output_path=f"s3://{bucket}/models",
-        base_job_name=f"{name}-train",
-        sagemaker_session=session,
-    )
-    step_train = TrainingStep(
-        name="Train",
-        step_args=estimator.fit(
-            {
-                "train": TrainingInput(
-                    s3_data=step_preprocess.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri,
-                    content_type="text/csv",
-                )
-            }
-        ),
-    )
+        # --- 2. Train
+        estimator = SKLearn(
+            entry_point="train.py",
+            source_dir=CODE_DIR,
+            framework_version=SKLEARN_VERSION,
+            role=role_arn,
+            instance_type=training_instance_type,
+            instance_count=1,
+            output_path=f"s3://{bucket}/models",
+            base_job_name=f"{name}-train",
+            sagemaker_session=session,
+        )
+        step_train = TrainingStep(
+            name="Train",
+            step_args=estimator.fit(
+                {
+                    "train": TrainingInput(
+                        s3_data=step_preprocess.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri,
+                        content_type="text/csv",
+                    )
+                }
+            ),
+        )
+        model_data = step_train.properties.ModelArtifacts.S3ModelArtifacts
+        training_steps = [step_preprocess, step_train]
 
     # --- 3. Evaluate against the fixed holdout set
     evaluation_report = PropertyFile(name="EvaluationReport", output_name="evaluation", path="evaluation.json")
@@ -122,10 +157,7 @@ def build_pipeline(stage: str, bucket: str, role_arn: str, session: PipelineSess
             code="evaluate.py",
             source_dir=CODE_DIR,
             inputs=[
-                ProcessingInput(
-                    source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-                    destination="/opt/ml/processing/model",
-                ),
+                ProcessingInput(source=model_data, destination="/opt/ml/processing/model"),
                 ProcessingInput(source=test_data_uri, destination="/opt/ml/processing/test"),
             ],
             outputs=[
@@ -141,7 +173,7 @@ def build_pipeline(stage: str, bucket: str, role_arn: str, session: PipelineSess
 
     # --- 4a. Register (only reached when the thresholds pass)
     model = SKLearnModel(
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+        model_data=model_data,
         entry_point="inference.py",
         source_dir=CODE_DIR,
         framework_version=SKLEARN_VERSION,
@@ -204,7 +236,7 @@ def build_pipeline(stage: str, bucket: str, role_arn: str, session: PipelineSess
             input_data_uri, test_data_uri, r2_threshold, rmse_threshold,
             processing_instance_type, training_instance_type, approval_status,
         ],
-        steps=[step_preprocess, step_train, step_evaluate, step_condition],
+        steps=[*training_steps, step_evaluate, step_condition],
         sagemaker_session=session,
     )
 
@@ -236,6 +268,11 @@ def main() -> None:
     parser.add_argument("--bucket", help="Training bucket (default: from stack outputs)")
     parser.add_argument("--role-arn", help="SageMaker execution role (default: from stack outputs)")
     parser.add_argument("--print-definition", action="store_true", help="Print the JSON definition and exit")
+    parser.add_argument(
+        "--training-job",
+        action="store_true",
+        help="Train in a SageMaker Training job instead of inside the processing job",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -251,7 +288,10 @@ def main() -> None:
         default_bucket=args.bucket,
         default_bucket_prefix="sagemaker",
     )
-    pipeline = build_pipeline(args.stage, args.bucket, args.role_arn, session)
+    pipeline = build_pipeline(
+        args.stage, args.bucket, args.role_arn, session,
+        train_in_processing_job=TRAIN_IN_PROCESSING_JOB and not args.training_job,
+    )
 
     if args.print_definition:
         print(json.dumps(json.loads(pipeline.definition()), indent=2))

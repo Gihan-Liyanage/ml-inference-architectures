@@ -11,6 +11,13 @@ Once you approve the model, it is deployed to a **SageMaker Serverless Inference
 
 ## Architecture
 
+![Architecture diagram](docs/architecture.png)
+
+<sub>Source: [docs/architecture.html](docs/architecture.html) (re-render instructions inside).</sub>
+
+<details>
+<summary>Text version</summary>
+
 ```
 aws s3 cp train.csv s3://codewave-<stage>-ml-training/data/train/<name>.csv
    │  (bucket sends events to EventBridge)
@@ -31,6 +38,10 @@ SageMaker Model Registry: group "mpg-linear-regression-<stage>"
 Any failed pipeline execution ─▶ SNS email
 ```
 
+</details>
+
+> **Temporary mode (current default): training happens inside the Preprocess processing job.** This account has no SageMaker training-job quota yet, so `TRAIN_IN_PROCESSING_JOB = True` in `pipeline/build_pipeline.py`. With that set, Preprocess and Train run as a single `PreprocessAndTrain` step on `ml.t3.medium` (`preprocess_and_train.py`). It writes the same `model.tar.gz` a Training job would, so Evaluate, the registry and the endpoint don't change. Once the training quota is approved (see [Service quotas](#service-quotas)), set it to `False` and re-run `build_pipeline.py` to restore the separate Train step. `build_pipeline.py --training-job` does the same for a single upsert.
+
 The pipeline steps share one code bundle in [`pipeline/code/`](pipeline/code):
 
 | Step | Script | Input | Output |
@@ -38,6 +49,7 @@ The pipeline steps share one code bundle in [`pipeline/code/`](pipeline/code):
 | Preprocess | `preprocess.py` | uploaded CSV(s) | cleaned `train.csv` (fails on missing columns or < 50 usable rows) |
 | Train | `train.py` | cleaned CSV | `model.tar.gz` containing `model.joblib` |
 | Evaluate | `evaluate.py` | model + `data/test/mpg_test.csv` | `evaluation.json` (`regression_metrics.r2/rmse/mae`) |
+| PreprocessAndTrain *(temporary)* | `preprocess_and_train.py` | uploaded CSV(s) | cleaned `train.csv` + `model.tar.gz`; replaces Preprocess + Train while `TRAIN_IN_PROCESSING_JOB = True` |
 | Serve | `inference.py` | JSON request | `{"predicted_mpg": [...]}` |
 
 `common.py` holds the column lists, cleaning and the model definition taken from the notebook. Every step imports it, so training and serving cannot drift.
@@ -59,10 +71,11 @@ The pipeline steps share one code bundle in [`pipeline/code/`](pipeline/code):
 | 11 | **Pipeline execution role uses `AmazonSageMakerFullAccess` + an inline policy for the training bucket** | Keeps the role simple for a solo project; the Lambda roles are least-privilege. Narrow the execution role before using this in production. |
 | 12 | **`mpg.csv` is vendored in `seed-data/`** | Project 1's `scripts/` folder is gitignored, so the dataset is copied here to make the tests and the split script work from a clean clone. |
 | 13 | **CI/CD with GitHub Actions + OIDC; one workflow runs `sls deploy` then `build_pipeline.py`** | The repo already lives on GitHub, so there's no second CI system to run. OIDC gives short-lived AWS credentials, with no stored keys. The order matters: the pipeline upsert reads the bucket and role from the stack that `sls deploy` just created or updated. The upsert is idempotent, so running it on every deploy is safe. |
+| 14 | **Temporary: train inside the Preprocess processing job** (`TRAIN_IN_PROCESSING_JOB`) | New accounts start with a SageMaker training-job quota of 0 for every instance type, and `ml.t3.medium` isn't offered for training at all. The processing quota is already 4 × `ml.t3.medium`, which is plenty for 392 rows. The model artifact keeps the Training-job layout, so switching back is a one-line change. The cost of this mode: no Training-job entry or training metrics in Studio while it's on. |
 
 ## Service quotas
 
-Each run needs one `ml.t3.medium` **processing** instance and one `ml.t3.large` **training** instance. New AWS accounts start with a training quota of **0** for every instance type, so request 1 before the first run. Quotas are per region.
+Each run needs one `ml.t3.medium` **processing** instance and, unless the temporary train-in-processing mode is on, one `ml.t3.large` **training** instance. New AWS accounts start with a training quota of **0** for every instance type, so request 1 before the first run. Quotas are per region.
 
 ```bash
 aws service-quotas request-service-quota-increase --service-code sagemaker \
@@ -71,7 +84,7 @@ aws service-quotas get-service-quota --service-code sagemaker \
   --quota-code L-B95AAE44 --region eu-west-1 --query "Quota.Value" # 1.0 once approved
 ```
 
-Without it, the Train step fails with `ResourceLimitExceeded`. To use a different training instance type, change the `TrainingInstanceType` default in `pipeline/build_pipeline.py` and re-run the upsert. Pick a type whose training quota you've been granted.
+Without it, the Train step fails with `ResourceLimitExceeded`. That's why the pipeline currently trains inside the processing job; see the note under [Architecture](#architecture). To use a different training instance type, change the `TrainingInstanceType` default in `pipeline/build_pipeline.py` and re-run the upsert. Pick a type whose training quota you've been granted.
 
 ## Deployment
 

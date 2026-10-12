@@ -9,8 +9,7 @@ BUCKET = "codewave-test-ml-training"
 ROLE = "arn:aws:iam::123456789012:role/sagemaker-test"
 
 
-@pytest.fixture(scope="module")
-def definition():
+def _definition(train_in_processing_job: bool) -> dict:
     from sagemaker.workflow.pipeline_context import PipelineSession
 
     from pipeline.build_pipeline import build_pipeline
@@ -21,7 +20,23 @@ def definition():
             Bucket=BUCKET, CreateBucketConfiguration={"LocationConstraint": "eu-west-1"}
         )
         session = PipelineSession(boto_session=boto_session, default_bucket=BUCKET, default_bucket_prefix="sagemaker")
-        yield json.loads(build_pipeline("test", BUCKET, ROLE, session).definition())
+        pipeline = build_pipeline("test", BUCKET, ROLE, session, train_in_processing_job=train_in_processing_job)
+        return json.loads(pipeline.definition())
+
+
+@pytest.fixture(scope="module", params=[True, False], ids=["train-in-processing", "training-job"])
+def definition(request):
+    return _definition(request.param)
+
+
+@pytest.fixture(scope="module")
+def processing_definition():
+    return _definition(True)
+
+
+@pytest.fixture(scope="module")
+def training_job_definition():
+    return _definition(False)
 
 
 def _steps(definition):
@@ -45,10 +60,22 @@ def test_parameters(definition):
     assert params["ModelApprovalStatus"] == "PendingManualApproval"
 
 
-def test_step_graph(definition):
+def test_step_graph_training_job(training_job_definition):
+    assert [s["Name"] for s in training_job_definition["Steps"]] == ["Preprocess", "Train", "Evaluate", "CheckMetrics"]
+
+
+def test_step_graph_train_in_processing(processing_definition):
+    steps = processing_definition["Steps"]
+
+    assert [s["Name"] for s in steps] == ["PreprocessAndTrain", "Evaluate", "CheckMetrics"]
+    assert steps[0]["Type"] == "Processing"
+    model_input = next(i for i in steps[1]["Arguments"]["ProcessingInputs"] if i["InputName"] == "input-1")
+    assert "Steps.PreprocessAndTrain.ProcessingOutputConfig.Outputs['model'].S3Output.S3Uri" in json.dumps(model_input)
+
+
+def test_branches(definition):
     steps = _steps(definition)
 
-    assert [s["Name"] for s in definition["Steps"]] == ["Preprocess", "Train", "Evaluate", "CheckMetrics"]
     assert steps["MetricsBelowThreshold"]["Type"] == "Fail"
     assert [s["Name"] for s in steps["CheckMetrics"]["Arguments"]["ElseSteps"]] == ["MetricsBelowThreshold"]
     # ModelStep expands register into a repack step plus the registration itself

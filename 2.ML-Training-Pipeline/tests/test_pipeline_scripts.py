@@ -94,3 +94,21 @@ def test_trained_model_predicts_from_feature_columns(evaluation, raw_mpg):
     prediction = model.predict(prepare_features(clean(raw_mpg).head(3)[FEATURES]))
 
     assert prediction.shape == (3,)
+
+
+def test_preprocess_and_train_emits_model_archive_evaluate_can_read(tmp_path, holdout_split):
+    import preprocess_and_train
+
+    train_csv, test_csv = holdout_split
+    for name in ("input", "test"):
+        (tmp_path / name).mkdir()
+    shutil.copy(train_csv, tmp_path / "input")
+    shutil.copy(test_csv, tmp_path / "test")
+
+    archive = preprocess_and_train.main(str(tmp_path / "input"), str(tmp_path / "train"), str(tmp_path / "model"))
+    report = evaluate.main(str(tmp_path / "model"), str(tmp_path / "test"), str(tmp_path / "evaluation"))
+
+    with tarfile.open(archive) as tar:
+        assert tar.getnames() == ["model.joblib"]  # same layout as a Training job's model.tar.gz
+    assert (tmp_path / "train" / "train.csv").exists()
+    assert report["regression_metrics"]["r2"]["value"] == pytest.approx(0.827, abs=0.005)
