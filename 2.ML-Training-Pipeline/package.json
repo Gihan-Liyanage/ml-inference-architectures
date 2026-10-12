@@ -1,0 +1,11 @@
+{
+  "name": "service-2.ml-training-pipeline",
+  "version": "1.0.0",
+  "private": true,
+  "author": "gihan liyanage",
+  "license": "MIT",
+  "description": "SageMaker training pipeline for the Auto MPG model",
+  "dependencies": {
+    "serverless": "^3.40.0"
+  }
+}

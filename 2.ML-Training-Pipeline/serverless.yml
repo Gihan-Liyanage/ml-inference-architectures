@@ -1,0 +1,279 @@
+service: ml-training-pipeline
+
+frameworkVersion: '3'
+
+custom:
+  trainingBucketName: codewave-${sls:stage}-ml-training
+  # Must match pipeline_name() / model_package_group_name() in pipeline/build_pipeline.py
+  pipelineName: mpg-training-${sls:stage}
+  modelPackageGroupName: mpg-linear-regression-${sls:stage}
+  endpointName: mpg-${sls:stage}-serverless
+  # Deployment gate. Passed to every execution, so changing them only needs `sls deploy`.
+  r2Threshold: '0.80'
+  rmseThreshold: '3.5'
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64
+  stage: dev
+  region: eu-west-1
+  timeout: 30
+
+  environment:
+    LOG_LEVEL: ${env:LOG_LEVEL, 'INFO'}
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sagemaker:StartPipelineExecution
+          Resource: arn:aws:sagemaker:${aws:region}:${aws:accountId}:pipeline/${self:custom.pipelineName}
+        - Effect: Allow
+          Action:
+            - sagemaker:CreateModel
+            - sagemaker:CreateEndpointConfig
+            - sagemaker:CreateEndpoint
+            - sagemaker:UpdateEndpoint
+            - sagemaker:DescribeEndpoint
+          Resource:
+            - arn:aws:sagemaker:${aws:region}:${aws:accountId}:model/${self:custom.endpointName}-*
+            - arn:aws:sagemaker:${aws:region}:${aws:accountId}:endpoint-config/${self:custom.endpointName}-*
+            - arn:aws:sagemaker:${aws:region}:${aws:accountId}:endpoint/${self:custom.endpointName}
+        - Effect: Allow
+          Action:
+            - sagemaker:DescribeModelPackage
+          Resource: arn:aws:sagemaker:${aws:region}:${aws:accountId}:model-package/${self:custom.modelPackageGroupName}/*
+        - Effect: Allow
+          Action:
+            - iam:PassRole
+          Resource: !GetAtt SageMakerExecutionRole.Arn
+          Condition:
+            StringEquals:
+              iam:PassedToService: sagemaker.amazonaws.com
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource: !GetAtt FailedEventsQueue.Arn
+
+package:
+  patterns:
+    - '!**'
+    - 'functions/**'
+    - '!**/__pycache__/**'
+
+functions:
+  startPipeline:
+    handler: functions/start_pipeline.handler
+    environment:
+      PIPELINE_NAME: ${self:custom.pipelineName}
+      R2_THRESHOLD: ${self:custom.r2Threshold}
+      RMSE_THRESHOLD: ${self:custom.rmseThreshold}
+    destinations:
+      onFailure:
+        type: sqs
+        arn: !GetAtt FailedEventsQueue.Arn
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.s3
+            detail-type:
+              - Object Created
+            detail:
+              bucket:
+                name:
+                  - ${self:custom.trainingBucketName}
+              object:
+                key:
+                  - wildcard: data/train/*.csv
+          retryPolicy:
+            maximumEventAge: 3600
+            maximumRetryAttempts: 3
+          deadLetterQueueArn: !GetAtt FailedEventsQueue.Arn
+
+  deployModel:
+    handler: functions/deploy_model.handler
+    timeout: 60
+    environment:
+      MODEL_PACKAGE_GROUP_NAME: ${self:custom.modelPackageGroupName}
+      ENDPOINT_NAME: ${self:custom.endpointName}
+      SAGEMAKER_EXECUTION_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+      SERVERLESS_MEMORY_MB: '2048'
+      SERVERLESS_MAX_CONCURRENCY: '5'
+    destinations:
+      onFailure:
+        type: sqs
+        arn: !GetAtt FailedEventsQueue.Arn
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - aws.sagemaker
+            detail-type:
+              - SageMaker Model Package State Change
+            detail:
+              ModelPackageGroupName:
+                - ${self:custom.modelPackageGroupName}
+              ModelApprovalStatus:
+                - Approved
+          retryPolicy:
+            maximumEventAge: 3600
+            maximumRetryAttempts: 3
+          deadLetterQueueArn: !GetAtt FailedEventsQueue.Arn
+
+resources:
+  Resources:
+    TrainingBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain
+      Properties:
+        BucketName: ${self:custom.trainingBucketName}
+        VersioningConfiguration:
+          Status: Enabled
+        NotificationConfiguration:
+          EventBridgeConfiguration:
+            EventBridgeEnabled: true
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    # Role assumed by the pipeline and every job/model it creates.
+    SageMakerExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${sls:stage}-sagemaker-${aws:region}
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sagemaker.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        Policies:
+          - PolicyName: training-bucket-access
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:ListBucket
+                    - s3:GetBucketLocation
+                  Resource:
+                    - !GetAtt TrainingBucket.Arn
+                    - !Join ['', [!GetAtt TrainingBucket.Arn, '/*']]
+
+    FailedEventsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-failed-events
+        MessageRetentionPeriod: 1209600
+
+    FailedEventsQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref FailedEventsQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt FailedEventsQueue.Arn
+
+    AlertsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${sls:stage}-alerts
+
+    AlertsEmailSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AlertsTopic
+        Protocol: email
+        Endpoint: ${param:alertEmail}
+
+    AlertsTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        Topics:
+          - !Ref AlertsTopic
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sns:Publish
+              Resource: !Ref AlertsTopic
+
+    ApprovalPendingRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Description: Email when a model version passes the gate and waits for approval
+        EventPattern:
+          source:
+            - aws.sagemaker
+          detail-type:
+            - SageMaker Model Package State Change
+          detail:
+            ModelPackageGroupName:
+              - ${self:custom.modelPackageGroupName}
+            ModelApprovalStatus:
+              - PendingManualApproval
+        Targets:
+          - Id: alerts
+            Arn: !Ref AlertsTopic
+            InputTransformer:
+              InputPathsMap:
+                version: $.detail.ModelPackageVersion
+                arn: $.detail.ModelPackageArn
+              InputTemplate: >-
+                "Model version <version> of ${self:custom.modelPackageGroupName} passed the metric gate and is waiting for approval.
+                Review its metrics in SageMaker Studio (Models > Model registry), then approve with:
+                aws sagemaker update-model-package --model-package-arn <arn> --model-approval-status Approved"
+
+    PipelineFailedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Description: Email when a training pipeline execution fails (including the metric gate)
+        EventPattern:
+          source:
+            - aws.sagemaker
+          detail-type:
+            - SageMaker Model Building Pipeline Execution Status Change
+          detail:
+            pipelineArn:
+              - arn:aws:sagemaker:${aws:region}:${aws:accountId}:pipeline/${self:custom.pipelineName}
+            currentPipelineExecutionStatus:
+              - Failed
+        Targets:
+          - Id: alerts
+            Arn: !Ref AlertsTopic
+            InputTransformer:
+              InputPathsMap:
+                name: $.detail.pipelineExecutionDisplayName
+                arn: $.detail.pipelineExecutionArn
+              InputTemplate: >-
+                "Training pipeline run <name> failed (a failed metric gate also lands here).
+                Inspect it with: aws sagemaker list-pipeline-execution-steps --pipeline-execution-arn <arn>"
+
+  Outputs:
+    TrainingBucketName:
+      Value: !Ref TrainingBucket
+    SageMakerExecutionRoleArn:
+      Value: !GetAtt SageMakerExecutionRole.Arn
+    AlertsTopicArn:
+      Value: !Ref AlertsTopic
+    FailedEventsQueueUrl:
+      Value: !Ref FailedEventsQueue
