@@ -58,6 +58,20 @@ The pipeline steps share one code bundle in [`pipeline/code/`](pipeline/code):
 | 10 | **Deploy via `Containers=[{ModelPackageName}]` with fresh model/config names and a fixed endpoint name** | The endpoint runs exactly the approved package (image + artifact + `inference.py`). Models and endpoint configs are immutable, so each deploy creates new ones and calls `UpdateEndpoint`, a blue/green swap with no downtime. |
 | 11 | **Pipeline execution role uses `AmazonSageMakerFullAccess` + an inline policy for the training bucket** | Keeps the role simple for a solo project; the Lambda roles are least-privilege. Narrow the execution role before using this in production. |
 | 12 | **`mpg.csv` is vendored in `seed-data/`** | Project 1's `scripts/` folder is gitignored, so the dataset is copied here to make the tests and the split script work from a clean clone. |
+| 13 | **CI/CD with GitHub Actions + OIDC; one workflow runs `sls deploy` then `build_pipeline.py`** | The repo already lives on GitHub, so there's no second CI system to run. OIDC gives short-lived AWS credentials, with no stored keys. The order matters: the pipeline upsert reads the bucket and role from the stack that `sls deploy` just created or updated. The upsert is idempotent, so running it on every deploy is safe. |
+
+## Service quotas
+
+Each run needs one `ml.t3.medium` **processing** instance and one `ml.t3.large` **training** instance. New AWS accounts start with a training quota of **0** for every instance type, so request 1 before the first run. Quotas are per region.
+
+```bash
+aws service-quotas request-service-quota-increase --service-code sagemaker \
+  --quota-code L-B95AAE44 --desired-value 1 --region eu-west-1    # ml.t3.large for training job usage
+aws service-quotas get-service-quota --service-code sagemaker \
+  --quota-code L-B95AAE44 --region eu-west-1 --query "Quota.Value" # 1.0 once approved
+```
+
+Without it, the Train step fails with `ResourceLimitExceeded`. To use a different training instance type, change the `TrainingInstanceType` default in `pipeline/build_pipeline.py` and re-run the upsert. Pick a type whose training quota you've been granted.
 
 ## Deployment
 
@@ -81,6 +95,39 @@ aws s3 cp data/mpg_test.csv s3://codewave-dev-ml-training/data/test/mpg_test.csv
 ```
 
 `sls package` warns that `python3.12` isn't in Serverless v3's runtime list. The warning is harmless: CloudFormation and Lambda accept the runtime.
+
+## CI/CD (GitHub Actions)
+
+[`.github/workflows/ml-training-pipeline.yml`](../.github/workflows/ml-training-pipeline.yml) automates steps 1–2 above. It only runs when `2.ML-Training-Pipeline/**` or the workflow itself changes.
+
+| Trigger | What runs |
+|---|---|
+| Pull request | `pytest` |
+| Push to `development` | `pytest` → `sls deploy --stage dev` → `build_pipeline.py --stage dev` |
+| Manual (*Actions → ml-training-pipeline → Run workflow*) | Same as the push row, for the chosen stage (`dev` or `prod`) |
+
+Deploys to the same stage are queued, never run in parallel. The workflow authenticates to AWS with **GitHub OIDC**, so no AWS keys are stored in GitHub. Step 3, uploading the holdout test set, is still a one-off manual step per stage.
+
+### One-time setup
+
+1. **Create the deploy role** that GitHub assumes. Do this once per AWS account.
+   ```bash
+   aws cloudformation deploy --profile codewave --region eu-west-1 \
+     --template-file ci/github-oidc-role.yml \
+     --stack-name github-actions-ml-training-pipeline \
+     --capabilities CAPABILITY_NAMED_IAM
+   # Add --parameter-overrides CreateOidcProvider=false if the account already has
+   # the token.actions.githubusercontent.com OIDC provider (only one is allowed).
+   aws cloudformation describe-stacks --stack-name github-actions-ml-training-pipeline \
+     --query "Stacks[0].Outputs" --profile codewave --region eu-west-1
+   ```
+2. **Create the GitHub Environments.** In GitHub, go to *Settings → Environments* and create `dev` and `prod`. The role only trusts jobs running in these two environments.
+   - Set these variables on each environment:
+     - `AWS_DEPLOY_ROLE_ARN`: the `DeployRoleArn` output from step 1.
+     - `ALERT_EMAIL`: where the approval and failure emails go.
+   - Recommended protection: limit both environments to the `development` branch, and add **required reviewers** on `prod` so a prod deploy waits for approval.
+
+The role's permissions are scoped to this stack's resource names (`ml-training-pipeline-*`, `codewave-*-ml-training`, `mpg-training-*`, `mpg-linear-regression-*`). It can still create IAM roles with that prefix, which `sls deploy` needs, so treat the `dev`/`prod` environment protection as part of the security boundary. If a deploy fails with `AccessDenied`, add the action named in the error to `ci/github-oidc-role.yml` and redeploy that stack.
 
 ## Run it
 

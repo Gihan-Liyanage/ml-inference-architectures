@@ -1,0 +1,105 @@
+name: ml-training-pipeline
+
+# PRs: tests only. Push to development: test → deploy dev.
+# Manual run: deploy dev or prod (gate prod with required reviewers on its GitHub Environment).
+on:
+  pull_request:
+    paths:
+      - '2.ML-Training-Pipeline/**'
+      - '.github/workflows/ml-training-pipeline.yml'
+  push:
+    branches: [development]
+    paths:
+      - '2.ML-Training-Pipeline/**'
+      - '.github/workflows/ml-training-pipeline.yml'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Stage to deploy
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  contents: read
+
+env:
+  POETRY_VERSION: '2.1.3'
+  PYTHON_VERSION: '3.12'
+  AWS_REGION: eu-west-1
+  SAGEMAKER_SUPPRESS_V2_WARNING: '1'
+  SLS_TELEMETRY_DISABLED: '1'
+
+defaults:
+  run:
+    working-directory: 2.ML-Training-Pipeline
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Poetry
+        run: pipx install "poetry==${POETRY_VERSION}"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: poetry
+          cache-dependency-path: 2.ML-Training-Pipeline/poetry.lock
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Run tests
+        run: poetry run pytest
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.stage || 'dev' }}
+    # One deploy per stage at a time; queue rather than cancel a half-finished deploy.
+    concurrency:
+      group: ml-training-pipeline-deploy-${{ inputs.stage || 'dev' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write  # OIDC token for AWS, no stored AWS keys
+    env:
+      STAGE: ${{ inputs.stage || 'dev' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: 2.ML-Training-Pipeline/.nvmrc
+          cache: npm
+          cache-dependency-path: 2.ML-Training-Pipeline/package-lock.json
+
+      - name: Install Poetry
+        run: pipx install "poetry==${POETRY_VERSION}"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: poetry
+          cache-dependency-path: 2.ML-Training-Pipeline/poetry.lock
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          poetry install --only main --no-interaction
+
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Infrastructure first: build_pipeline.py reads the bucket and role from this stack's outputs.
+      - name: Deploy infrastructure (Serverless)
+        run: npx sls deploy --stage "$STAGE" --param="alertEmail=${{ vars.ALERT_EMAIL }}"
+
+      - name: Create/update SageMaker pipeline
+        run: poetry run python pipeline/build_pipeline.py --stage "$STAGE" --region "$AWS_REGION"

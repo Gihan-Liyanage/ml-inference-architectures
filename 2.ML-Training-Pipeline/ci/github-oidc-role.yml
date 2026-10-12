@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  IAM role that the GitHub Actions workflow .github/workflows/ml-training-pipeline.yml
+  assumes through OIDC to deploy 2.ML-Training-Pipeline (sls deploy + build_pipeline.py).
+  Deploy once per AWS account; see README "CI/CD".
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: Gihan-Liyanage
+  RepoName:
+    Type: String
+    Default: ml-inference-architectures
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: An account can hold only one GitHub OIDC provider; set 'false' if it already exists.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-actions-ml-training-pipeline-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Only jobs running in the repo's dev/prod GitHub Environments can assume the role.
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOwner}/${RepoName}:environment:dev
+                  - !Sub repo:${GitHubOwner}/${RepoName}:environment:prod
+      Policies:
+        - PolicyName: deploy-ml-training-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # --- sls deploy (CloudFormation runs with these credentials)
+              - Sid: CloudFormationStack
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/ml-training-pipeline-*/*
+              - Sid: CloudFormationGlobal
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: '*'
+              - Sid: Buckets  # Serverless deployment bucket + training bucket
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - arn:aws:s3:::ml-training-pipeline-*
+                  - arn:aws:s3:::ml-training-pipeline-*/*
+                  - arn:aws:s3:::codewave-*-ml-training
+                  - arn:aws:s3:::codewave-*-ml-training/*
+              - Sid: Lambda
+                Effect: Allow
+                Action: lambda:*
+                Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ml-training-pipeline-*
+              - Sid: Logs
+                Effect: Allow
+                Action: logs:*
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ml-training-pipeline-*
+              - Sid: LogsDescribe
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+              - Sid: StackRoles  # Lambda role + SageMaker execution role created by the stack
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/ml-training-pipeline-*
+              - Sid: PassStackRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/ml-training-pipeline-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - sagemaker.amazonaws.com
+              - Sid: Events
+                Effect: Allow
+                Action: events:*
+                Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/ml-training-pipeline-*
+              - Sid: Sns
+                Effect: Allow
+                Action: sns:*
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:ml-training-pipeline-*
+              - Sid: Sqs
+                Effect: Allow
+                Action: sqs:*
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:ml-training-pipeline-*
+              # --- build_pipeline.py (upsert pipeline, ensure model package group)
+              - Sid: SageMakerPipeline
+                Effect: Allow
+                Action:
+                  - sagemaker:CreatePipeline
+                  - sagemaker:UpdatePipeline
+                  - sagemaker:DescribePipeline
+                  - sagemaker:AddTags
+                  - sagemaker:ListTags
+                Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:pipeline/mpg-training-*
+              - Sid: SageMakerModelPackageGroup
+                Effect: Allow
+                Action:
+                  - sagemaker:CreateModelPackageGroup
+                  - sagemaker:DescribeModelPackageGroup
+                  - sagemaker:AddTags
+                Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model-package-group/mpg-linear-regression-*
+
+Outputs:
+  DeployRoleArn:
+    Description: Set as the AWS_DEPLOY_ROLE_ARN variable on the GitHub Environments
+    Value: !GetAtt DeployRole.Arn

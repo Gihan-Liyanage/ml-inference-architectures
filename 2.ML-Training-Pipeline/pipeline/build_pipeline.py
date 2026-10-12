@@ -63,7 +63,9 @@ def build_pipeline(stage: str, bucket: str, role_arn: str, session: PipelineSess
     r2_threshold = ParameterFloat("R2Threshold", default_value=DEFAULT_R2_THRESHOLD)
     rmse_threshold = ParameterFloat("RmseThreshold", default_value=DEFAULT_RMSE_THRESHOLD)
     processing_instance_type = ParameterString("ProcessingInstanceType", default_value="ml.t3.medium")
-    training_instance_type = ParameterString("TrainingInstanceType", default_value="ml.m5.large")
+    # ml.t3.medium isn't offered for training jobs; ml.t3.large is the smallest that is.
+    # Training quotas default to 0 on new accounts - see README "Service quotas".
+    training_instance_type = ParameterString("TrainingInstanceType", default_value="ml.t3.large")
     approval_status = ParameterString("ModelApprovalStatus", default_value="PendingManualApproval")
 
     processor = FrameworkProcessor(
